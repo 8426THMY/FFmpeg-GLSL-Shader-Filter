@@ -1,0 +1,493 @@
+#include <windows.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "config_components.h"
+
+#include "libavutil/avstring.h"
+#include "libavutil/mem.h"
+#include "libavutil/opt.h"
+#include "libavutil/file.h"
+#include "libavutil/file_open.h"
+#include "libavutil/pixdesc.h"
+
+#include "avfilter.h"
+#include "filters.h"
+#include "framesync.h"
+#include "video.h"
+
+#define GLEW_STATIC
+#include <GL/glew.h>
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_opengl.h>
+
+
+// Target OpenGL 3.30 Core by default.
+#define GL_VERSION_PROFILE SDL_GL_CONTEXT_PROFILE_CORE
+#define GL_VERSION_MAJOR   3
+#define GL_VERSION_MINOR   3
+
+
+static const GLchar *vertex_src = 
+	"#version 330 core\n"
+	"in vec2 pos;\n"
+	"out vec2 uv;\n"
+	"void main(){\n"
+	"	gl_Position = vec4(pos, 0.f, 1.f);\n"
+	"	uv = 0.5f*(pos + 1.f);\n"
+	"}"
+;
+
+static const float vertices[12] = {
+	-1.f, -1.f,  1.f, -1.f,  -1.f, 1.f,
+	-1.f,  1.f,  1.f, -1.f,   1.f, 1.f
+};
+
+
+typedef struct GlslShaderSampler {
+	GLint texture_location;
+	GLuint texture_id;
+	AVFrame *frame;
+} GlslShaderSampler;
+
+typedef struct GlslShaderContext {
+	const AVClass *class;
+	int nb_inputs;
+	uint8_t *fragment_path;
+
+	SDL_Window *window;
+	GLuint program_id;
+	GLint time_location;
+	GLuint vao_id;
+	GLuint vbo_id;
+	GlslShaderSampler *samplers;
+
+	FFFrameSync fs;
+} GlslShaderContext;
+
+#define OFFSET(x) offsetof(GlslShaderContext, x)
+#define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
+static const AVOption glsl_shader_options[] = {
+	{"inputs", "set number of inputs", OFFSET(nb_inputs), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, FLAGS},
+	{"shader", "set fragment shader", OFFSET(fragment_path), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
+	{NULL}
+};
+
+AVFILTER_DEFINE_CLASS(glsl_shader);
+
+static const enum AVPixelFormat pix_fmts[] = {
+	AV_PIX_FMT_RGB24,
+	AV_PIX_FMT_NONE
+};
+
+
+static void check_gl_error(const char *const fmt){
+	const GLenum err = glGetError();
+	if(err != GL_NO_ERROR){
+		av_log(NULL, AV_LOG_ERROR, fmt, err);
+	}
+}
+
+static void delete_shader(const GLuint shader_id){
+	if(glIsShader(shader_id)){
+		glDeleteShader(shader_id);
+	}
+}
+
+static GLuint compile_shader(const GLchar *const shader_src, const GLenum shader_type){
+	GLint compiled;
+	GLuint shader_id = glCreateShader(shader_type);
+	if(!glIsShader(shader_id)){
+		av_log(NULL, AV_LOG_ERROR, "Failed to create shader object of type %u.\n", shader_type);
+		return 0;
+	}
+
+	glShaderSource(shader_id, 1, &shader_src, NULL);
+	glCompileShader(shader_id);
+	glGetShaderiv(shader_id, GL_COMPILE_STATUS, &compiled);
+	if(compiled){
+		return shader_id;
+	}
+
+	delete_shader(shader_id);
+	av_log(NULL, AV_LOG_ERROR, "Failed to compile shader of type %u.\n", shader_type);
+	return 0;
+}
+
+static GLuint load_shader(const uint8_t *const shader_path, const GLenum shader_type){
+	GLuint shader_id = 0;
+	FILE *shader_file = avpriv_fopen_utf8(shader_path, "rb");
+
+	if(shader_file != NULL){
+		// Get the length of the shader file.
+		const size_t length = (fseek(shader_file, 0, SEEK_END), ftell(shader_file));
+		GLchar *const shader_src = av_malloc((length + 1)*sizeof(*shader_src));
+
+		if(shader_src != NULL){
+			rewind(shader_file);
+			// Read the file contents into our buffer.
+			fread(shader_src, sizeof(GLchar), length, shader_file);
+			shader_src[length] = '\0';
+			fclose(shader_file);
+
+			// Compile the shader from its source.
+			shader_id = compile_shader(shader_src, shader_type);
+			av_free(shader_src);
+		}
+	}else{
+		av_log(NULL, AV_LOG_ERROR, "Failed to open shader file from path:\n\t%s.\n", shader_path);
+	}
+
+	return shader_id;
+}
+
+static void delete_shader_program(const GLuint program_id){
+	glUseProgram(0);
+	if(glIsProgram(program_id)){
+		glDeleteProgram(program_id);
+	}
+}
+
+static GLuint create_shader_program(const GLuint vertex_shader_id, const GLuint fragment_shader_id){
+	if(vertex_shader_id && fragment_shader_id){
+		GLint compiled;
+		const GLuint program_id = glCreateProgram();
+		if(!glIsProgram(program_id)){
+			av_log(NULL, AV_LOG_ERROR, "Failed to create shader program object.\n");
+			return 0;
+		}
+
+		// Attach the shaders and create the shader program.
+		glAttachShader(program_id, vertex_shader_id);
+		glAttachShader(program_id, fragment_shader_id);
+		glLinkProgram(program_id);
+		glGetProgramiv(program_id, GL_LINK_STATUS, &compiled);
+		if(compiled){
+			glDetachShader(program_id, vertex_shader_id);
+			glDetachShader(program_id, fragment_shader_id);
+			return program_id;
+		}
+
+		// Delete the shader program if it failed to compile.
+		delete_shader_program(program_id);
+		av_log(NULL, AV_LOG_ERROR, "Failed to create shader program.\n");
+	}
+
+	return 0;
+}
+
+
+static void delete_vao(GLuint *const vao_id, GLuint *const vbo_id){
+	if(glIsVertexArray(*vao_id)){
+		glDeleteVertexArrays(1, vao_id);
+	}
+	if(glIsBuffer(*vbo_id)){
+		glDeleteBuffers(1, vbo_id);
+	}
+}
+
+static void create_vao(GLuint *const vao_id, GLuint *const vbo_id){
+	glGenVertexArrays(1, vao_id);
+	glBindVertexArray(*vao_id);
+		glGenBuffers(1, vbo_id);
+		glBindBuffer(GL_ARRAY_BUFFER, *vbo_id);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+			glEnableVertexAttribArray(0);
+			glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+}
+
+
+static void delete_texture(const GLuint texture_id){
+	if(glIsTexture(texture_id)){
+		glDeleteTextures(1, &texture_id);
+	}
+}
+
+static GLuint create_texture(void){
+	GLuint texture_id;
+	glGenTextures(1, &texture_id);
+	glBindTexture(GL_TEXTURE_2D, texture_id);
+
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	return texture_id;
+}
+
+
+static av_cold int init(AVFilterContext *ctx){
+	GlslShaderContext *s = ctx->priv;
+	int ret;
+
+
+	{
+		GLenum err;
+
+		// Initialize SDL.
+		if(SDL_Init(SDL_INIT_VIDEO) < 0){
+			av_log(ctx, AV_LOG_ERROR, "Failed to initialize SDL2:\n\t%s\n", SDL_GetError());
+			return -1;
+		}
+
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,  GL_VERSION_PROFILE);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, GL_VERSION_MAJOR);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, GL_VERSION_MINOR);
+		SDL_GL_SetAttribute(SDL_GL_ACCELERATED_VISUAL, 1);
+		SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 0);
+
+		// Create a window for our OpenGL context.
+		// We set the window size in config_outputs().
+		s->window = SDL_CreateWindow(
+			"ffmpeg_glsl_shader",
+			SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+			0, 0,
+			SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN
+		);
+		if(s->window == NULL){
+			av_log(ctx, AV_LOG_ERROR, "Failed to create SDL2 window:\n\t%s\n", SDL_GetError());
+			return -1;
+		}
+		// Create and OpenGL context.
+		if(SDL_GL_CreateContext(s->window) == NULL){
+			av_log(ctx, AV_LOG_ERROR, "Failed to create SDL2 context:\n\t%s\n", SDL_GetError());
+			return -1;
+		}
+
+		// Initialize GLEW.
+		glewExperimental = GL_TRUE;
+		if((err = glewInit()) != GLEW_OK){
+			av_log(ctx, AV_LOG_ERROR, "Failed to initialize GLEW:\n\t%s\n", glewGetErrorString(err));
+			return -1;
+		}
+	}
+	
+	{
+		const GLuint vertex_shader_id = compile_shader(vertex_src, GL_VERTEX_SHADER);
+		const GLuint fragment_shader_id = load_shader(s->fragment_path, GL_FRAGMENT_SHADER);
+		GLint max_samplers;
+
+		// Compile the shader program.
+		s->program_id = create_shader_program(vertex_shader_id, fragment_shader_id);
+		delete_shader(vertex_shader_id);
+		delete_shader(fragment_shader_id);
+		if(!s->program_id){
+			return -1;
+		}
+		glUseProgram(s->program_id);
+		// Get the location of the time uniform in the shader, if it exists.
+		s->time_location = glGetUniformLocation(s->program_id, "time");
+
+		glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &max_samplers);
+		if(s->nb_inputs > max_samplers){
+			av_log(ctx, AV_LOG_WARNING, 
+				"Number of inputs (%i) exceeds maximum texture units (%u). Clamping down.\n",
+				s->nb_inputs, max_samplers
+			);
+			s->nb_inputs = max_samplers;
+		}
+
+		// Create a vertex array object for the fullscreen quad.
+		create_vao(&s->vao_id, &s->vbo_id);
+	}
+
+	{
+		unsigned int i;
+
+		// Allocate memory for each input's frame pointer and texture ID.
+		s->samplers = av_malloc(s->nb_inputs*sizeof(*s->samplers));
+		if(!s->samplers){
+			av_log(ctx, AV_LOG_ERROR, "Failed to allocate memory for samplers.\n");
+			return AVERROR(ENOMEM);
+		}
+
+		for(i = 0; i < s->nb_inputs; ++i){
+			AVFilterPad pad = {0};
+			// We don't really handle the case if the
+			// user has more than 9999 texture units.
+			GLchar texture_name[12] = "texture";
+
+
+			snprintf(&texture_name[7], 5, "%u", i);
+			s->samplers[i].texture_location = glGetUniformLocation(s->program_id, texture_name);
+			// If the shader doesn't use this sampler, ignore this and future inputs.
+			if(s->samplers[i].texture_location == -1){
+				av_log(ctx, AV_LOG_WARNING,
+					"Found %i inputs, but shader only has %u samplers. Clamping down.\n",
+					s->nb_inputs, i
+				);
+				s->nb_inputs = i;
+				s->samplers = av_realloc(s->samplers, i*sizeof(*s->samplers));
+				break;
+			}
+			// Create a texture for this input.
+			s->samplers[i].texture_id = create_texture();
+			glUniform1i(s->samplers[i].texture_location, i);
+
+
+			pad.type = AVMEDIA_TYPE_VIDEO;
+			pad.name = av_asprintf("input%d", i);
+			if(pad.name == NULL){
+				return AVERROR(ENOMEM);
+			}
+
+			if((ret = ff_append_inpad_free_name(ctx, &pad)) < 0){
+				return ret;
+			}
+		}
+	}
+
+
+	return 0;
+}
+
+static int process_frame(FFFrameSync *fs){
+	AVFilterContext *ctx = fs->parent;
+	GlslShaderContext *s = fs->opaque;
+	AVFilterLink *outlink = ctx->outputs[0];
+	AVFrame *out;
+	unsigned int i;
+
+
+	// Get the current frame for each input.
+	for(i = 0; i < s->nb_inputs; ++i){
+		GlslShaderSampler *sampler = &s->samplers[i];
+		const int ret = ff_framesync_get_frame(&s->fs, i, &sampler->frame, 0);
+
+		if(ret < 0){
+			av_log(ctx, AV_LOG_ERROR, "Failed to get frame of input %u.\n", i);
+			return ret;
+		}
+
+		glActiveTexture(GL_TEXTURE0 + i);
+		glBindTexture(GL_TEXTURE_2D, sampler->texture_id);
+		glTexImage2D(
+			GL_TEXTURE_2D, 0, GL_RGB, sampler->frame->width, sampler->frame->height,
+			0, GL_RGB, GL_UNSIGNED_BYTE, sampler->frame->data[0]
+		);
+	}
+
+
+	// Create a buffer for this frame of the output.
+	out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+	if(!out){
+		av_log(ctx, AV_LOG_ERROR, "Failed to allocate memory for output frame.\n");
+		return AVERROR(ENOMEM);
+	}
+	out->pts = av_rescale_q(s->fs.pts, s->fs.time_base, outlink->time_base);
+	out->sample_aspect_ratio = outlink->sample_aspect_ratio;
+
+
+	// Upload the current timestamp (in seconds) to its uniform.
+	if(s->time_location != -1){
+		glUniform1f(s->time_location, ((GLfloat)(out->pts*s->fs.time_base.num))/((GLfloat)s->fs.time_base.den));
+	}
+	glClear(GL_DEPTH_BUFFER_BIT);
+	// Render the output frame using the shader.
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+	// Execute the draw command and wait until it's completed.
+	glFlush();
+	glFinish();
+	// Read the frame buffer into the output buffer.
+	glReadPixels(0, 0, outlink->w, outlink->h, GL_RGB, GL_UNSIGNED_BYTE, (GLvoid *)out->data[0]);
+
+
+	return ff_filter_frame(outlink, out);
+}
+
+static int config_outputs(AVFilterLink *outlink){
+	AVFilterContext *ctx = outlink->src;
+	GlslShaderContext *s = ctx->priv;
+	FilterLink *il = ff_filter_link(ctx->inputs[0]);
+	FilterLink *ol = ff_filter_link(outlink);
+	FFFrameSyncIn *in;
+	const int width = ctx->inputs[0]->w;
+	const int height = ctx->inputs[0]->h;
+	int ret;
+	unsigned int i;
+
+
+	outlink->w                   = width;
+	outlink->h                   = height;
+	outlink->sample_aspect_ratio = ctx->inputs[0]->sample_aspect_ratio;
+	ol->frame_rate               = il->frame_rate;
+
+	if((ret = ff_framesync_init(&s->fs, ctx, s->nb_inputs)) < 0){
+		av_log(ctx, AV_LOG_ERROR, "Failed to initialize FFFrameSync.\n");
+		return ret;
+	}
+
+	in = s->fs.in;
+	s->fs.opaque = s;
+	s->fs.on_event = process_frame;
+
+	for(i = 0; i < s->nb_inputs; ++i){
+		AVFilterLink *inlink = ctx->inputs[i];
+
+		if(inlink->w != width || inlink->h != height){
+			av_log(ctx, AV_LOG_WARNING, "Input %u dimensions don't match output.\n", i);
+		}
+
+		in[i].time_base = inlink->time_base;
+		in[i].sync      = 1;
+		in[i].before    = EXT_STOP;
+		in[i].after     = EXT_INFINITY;
+	}
+
+	ret = ff_framesync_configure(&s->fs);
+	outlink->time_base = s->fs.time_base;
+
+
+	SDL_SetWindowSize(s->window, width, height);
+	glViewport(0, 0, width, height);
+
+	
+	return ret;
+}
+
+static int activate(AVFilterContext *ctx){
+	GlslShaderContext *s = ctx->priv;
+	return ff_framesync_activate(&s->fs);
+}
+
+static av_cold void uninit(AVFilterContext *ctx){
+	GlslShaderContext *s = ctx->priv;
+	unsigned int i;
+
+	ff_framesync_uninit(&s->fs);
+	for(i = 0; i < s->nb_inputs; ++i){
+		delete_texture(s->samplers[i].texture_id);
+	}
+	av_free(s->samplers);
+	delete_vao(&s->vao_id, &s->vbo_id);
+	delete_shader_program(s->program_id);
+	if(s->window != NULL){
+		SDL_DestroyWindow(s->window);
+	}
+	SDL_Quit();
+}
+
+
+static const AVFilterPad glsl_shader_outputs[] = {
+	{
+		.name         = "default",
+		.type         = AVMEDIA_TYPE_VIDEO,
+		.config_props = config_outputs
+	},
+};
+
+const FFFilter ff_vf_glsl_shader = {
+	.p.name        = "glsl_shader",
+	.p.description = NULL_IF_CONFIG_SMALL("Apply a GLSL shader."),
+	.p.priv_class  = &glsl_shader_class,
+	.p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
+	.priv_size     = sizeof(GlslShaderContext),
+	.init          = init,
+	.activate      = activate,
+	.uninit        = uninit,
+	FILTER_OUTPUTS(glsl_shader_outputs),
+	FILTER_PIXFMTS_ARRAY(pix_fmts)
+};
